@@ -41,7 +41,7 @@ public class Configs {
 	public static int DEFAULT_DELAYED_EVICT_COUNT = 4;
 	public static int SOFT_STASH_LIMIT = 24;
 	public static int HARD_STASH_LIMIT = 36;
-	public static int MAX_SINGLE_EVICT_PER_ACCESS = 2;
+	public static int MAX_SINGLE_EVICT_PER_ACCESS = 10;
 	
 	//request operation: read or write
 	public enum OPERATION{ORAM_ACCESS_READ,ORAM_ACCESS_WRITE};

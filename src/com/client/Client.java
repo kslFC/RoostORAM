@@ -1008,14 +1008,11 @@ public class Client implements ClientInterface {
     }
 
     private void delayed_single_evict_after_access(int accessedBlockIndex) {
-        boolean pressureActive = stash.size() > Configs.SOFT_STASH_LIMIT;
-
-        // Soft limit超過中だけ未アクセスブロックの猶予カウントを進める。
-        // これによりevict countを、stash圧力が続いてからevictを始めるまでの猶予として扱う。
+        // アクセスされたブロックは最近使われたものとして保持し、それ以外の寿命だけ減らす。
         for (Block block : stash.blocksSnapshot()) {
             if (block.getBlockIndex() == accessedBlockIndex) {
                 block.setEvictCount(Configs.DEFAULT_DELAYED_EVICT_COUNT);
-            } else if (pressureActive) {
+            } else {
                 block.decrementEvictCount();
             }
         }
@@ -1054,13 +1051,6 @@ public class Client implements ClientInterface {
             evict_path(fallbackPath);
             fallbackEvictCount++;
             evict_g = (evict_g + 1) % Configs.LEAF_COUNT;
-        }
-
-        // 単体evictまたはfallbackで圧力が解消したら、次回超過時の猶予を初期化する。
-        if (pressureActive && stash.size() <= Configs.SOFT_STASH_LIMIT) {
-            for (Block block : stash.blocksSnapshot()) {
-                block.setEvictCount(Configs.DEFAULT_DELAYED_EVICT_COUNT);
-            }
         }
     }
 
