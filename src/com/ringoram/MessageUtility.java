@@ -17,7 +17,7 @@ public class MessageUtility {
 	public static final int ORAM_READBUCKET = 3;//read bucket
 	public static final int ORAM_WRITEBUCKET = 4;//write bucket
 	public static final int ORAM_READBLOCK = 5;//read block
-	public static final int ORAM_READBLOCKS_PREFETCH = 6;//read target plus one LSH-similar block
+	public static final int ORAM_READBLOCKS_PREFETCH = 6;//read every valid real block on the target path
 	
 	   public static ByteBuffer createTypeReceiveBuffer() {
 	        // ヘッダだけを受信するための固定長buffer。

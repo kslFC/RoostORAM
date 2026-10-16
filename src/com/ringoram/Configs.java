@@ -36,10 +36,9 @@ public class Configs {
 	// 何回アクセスしたら定期evictを行うか。4なら4アクセスごとにevictする。
 	public static int SHUFFLE_RATE = 4;
 
-	// LSHモードの遅延evict設定。count初期値4、soft超過で単体evict、hard超過でpath fallback。
+	// LSHモードの遅延evict設定。count初期値4、期限切れで単体evict、hard超過でpath fallback。
 	// baselineはこれらを使わず、従来のSHUFFLE_RATEごとのpath evictを行う。
 	public static int DEFAULT_DELAYED_EVICT_COUNT = 4;
-	public static int SOFT_STASH_LIMIT = 24;
 	public static int HARD_STASH_LIMIT = 36;
 	public static int MAX_SINGLE_EVICT_PER_ACCESS = 10;
 	

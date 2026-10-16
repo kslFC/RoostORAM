@@ -33,8 +33,8 @@ import com.example.LSH;
  * ORAMクライアント本体。
  *
  * 実験では、通常のRing ORAM baselineと、READ後のleaf再割り当てにLSHを使う
- * LSH Ring ORAMを切り替える。LSHモードではhash-onlyクラスタリング、類似ブロックの
- * 最大1件prefetch、単体遅延evictを行い、baselineはランダムleafと定期path evictを使う。
+ * LSH Ring ORAMを切り替える。LSHモードではhash-onlyクラスタリング、目的ブロックの
+ * path上にある全実ブロックの取得、単体遅延evictを行い、baselineはランダムleafと定期path evictを使う。
  * cache無効時もstashはORAM内部状態として維持するが、READ前のhit判定には使用しない。
  */
 public class Client implements ClientInterface {
@@ -135,7 +135,9 @@ public class Client implements ClientInterface {
     private int serverReadCount;
     private boolean lastAccessStashHit;
     private String[] lshLeafMedoids;       // 自動選択された各クラスタの代表hash
-    private int[] lshLeafMedoidLeafIds;    // クラスタ番号から論理leaf IDへの対応
+    private int[] lshClusterLeafStarts;    // クラスタごとのlocal leaf範囲の開始位置
+    private int[] lshClusterLeafCounts;    // クラスタごとに利用できるleaf数
+    private int lshClusterPrefixBits;      // leaf上位bitのうちクラスタprefixとして固定する長さ
     private final String[] blockLshHashes; // .binから起動時に計算し、READ/prefetchで再利用するhash
     private long prefetchReadNanos;
     private long leafAssignmentNanos;
@@ -182,7 +184,9 @@ public class Client implements ClientInterface {
         this.serverReadCount = 0;
         this.lastAccessStashHit = false;
         this.lshLeafMedoids = null;
-        this.lshLeafMedoidLeafIds = null;
+        this.lshClusterLeafStarts = null;
+        this.lshClusterLeafCounts = null;
+        this.lshClusterPrefixBits = 0;
         this.blockLshHashes = new String[Configs.BLOCK_COUNT];
 
         this.stash = new Stash(mixSeed(oramSeed ^ 0xBB67AE8584CAA73BL));
@@ -356,9 +360,10 @@ public class Client implements ClientInterface {
     }
 
     private int chooseLeafFromHash(String hash) {
-        // 構築済みクラスタがあれば、最もハミング距離が小さいmedoidのleafを選ぶ。
-        // 同距離の場合は、走査順が先のクラスタ（小さいleaf ID）を採用する。
-        if (lshLeafMedoids == null || lshLeafMedoidLeafIds == null || lshLeafMedoids.length == 0) {
+        // 構築済みクラスタがあれば、最も近いmedoidのprefixを固定し、
+        // 下位suffixだけをREADごとにランダム化する。
+        if (lshLeafMedoids == null || lshClusterLeafStarts == null
+                || lshClusterLeafCounts == null || lshLeafMedoids.length == 0) {
             // 有効hash不足でクラスタを作れない場合だけ、全bitの多数決変換へfallbackする。
             return hashToLeafByBandMajority(hash, leafBits, Configs.LEAF_COUNT) + Configs.LEAF_START;
         }
@@ -372,7 +377,36 @@ public class Client implements ClientInterface {
                 bestCluster = i;
             }
         }
-        return lshLeafMedoidLeafIds[bestCluster];
+
+        int suffixBits = leafBits - lshClusterPrefixBits;
+        int suffix = 0;
+        for (int i = 0; i < suffixBits; i++) {
+            suffix = (suffix << 1) | (i < hash.length() && hash.charAt(i) == '1' ? 1 : 0);
+        }
+        int rangeCount = lshClusterLeafCounts[bestCluster];
+        int suffixMask = rangeCount - 1;
+        int randomSuffix = math.getRandomLeaf() & suffixMask;
+        int leafOffset = suffix ^ randomSuffix;
+        int leaf = Configs.LEAF_START + lshClusterLeafStarts[bestCluster] + leafOffset;
+        int rangeStart = Configs.LEAF_START + lshClusterLeafStarts[bestCluster];
+        int rangeEnd = rangeStart + rangeCount - 1;
+        if (leaf < rangeStart || leaf > rangeEnd) {
+            throw new IllegalStateException("LSH prefix placement escaped cluster range: cluster="
+                    + bestCluster + " leaf=" + leaf + " range=" + rangeStart + "-" + rangeEnd);
+        }
+        return leaf;
+    }
+
+    private static String binaryPrefix(int value, int bits) {
+        String binary = Integer.toBinaryString(value);
+        if (binary.length() >= bits) {
+            return binary;
+        }
+        StringBuilder padded = new StringBuilder(bits);
+        for (int i = binary.length(); i < bits; i++) {
+            padded.append('0');
+        }
+        return padded.append(binary).toString();
     }
 
     private int chooseLeafFromHashOrRandom(String hash) {
@@ -569,14 +603,21 @@ public class Client implements ClientInterface {
         if (selected == null) return;
         int clusterCount = selected.medoids.length;
         lshLeafMedoids = selected.medoids;
-        lshLeafMedoidLeafIds = new int[clusterCount];
-        // 選ばれたクラスタだけをLEAF_STARTから連続するleafへ対応付ける。
-        // 現在のデータでk=3なら、READ後の候補はleaf 7, 8, 9となる。
+        lshClusterLeafStarts = new int[clusterCount];
+        lshClusterLeafCounts = new int[clusterCount];
+        lshClusterPrefixBits = calcLeafBits(clusterCount);
+        int leavesPerCluster = 1 << (leafBits - lshClusterPrefixBits);
         for (int c = 0; c < clusterCount; c++) {
-            lshLeafMedoidLeafIds[c] = Configs.LEAF_START + c;
+            // cluster IDをleaf上位prefixとし、残りのsuffix範囲をクラスタへ割り当てる。
+            // cluster数が2の冪でない場合、未使用prefixに対応するleafは使用しない。
+            lshClusterLeafStarts[c] = c * leavesPerCluster;
+            lshClusterLeafCounts[c] = leavesPerCluster;
         }
 
         System.out.println("[LSH-AUTO-CLUSTER-SELECTED] clusters=" + clusterCount
+                + " rootPrefixBits=" + lshClusterPrefixBits
+                + " leavesPerCluster=" + leavesPerCluster
+                + " usedLeaves=" + (clusterCount * leavesPerCluster)
                 + " silhouette=" + String.format(java.util.Locale.ROOT, "%.4f", selectedScore));
         for (int c = 0; c < clusterCount; c++) {
             StringBuilder blocks = new StringBuilder();
@@ -589,7 +630,10 @@ public class Client implements ClientInterface {
                 }
             }
             System.out.println("[LSH-CLUSTER] cluster=" + c
-                    + " leaf=" + lshLeafMedoidLeafIds[c]
+                    + " rootPrefix=" + binaryPrefix(c, lshClusterPrefixBits)
+                    + " leafRange=" + (Configs.LEAF_START + lshClusterLeafStarts[c])
+                    + "-" + (Configs.LEAF_START + lshClusterLeafStarts[c]
+                            + lshClusterLeafCounts[c] - 1)
                     + " medoid=" + lshLeafMedoids[c]
                     + " blocks=[" + blocks + "]");
         }
@@ -652,9 +696,10 @@ public class Client implements ClientInterface {
      * ORAMアクセスの中心処理。
      *
      * READではcache有効時だけstashを先に確認し、hitならサーバへ行かずに返す。
-     * miss時はbaselineが目的ブロックと各bucketのdummyを読み、LSHは同一path上から
-     * 目的ブロックとhashが最も近い有効実ブロックを最大1個返す。READ後の論理leafは、
-     * baselineではランダム、LSHでは最近傍medoidのleafへ再割り当てする。
+     * miss時はbaselineが目的ブロックと各bucketのdummyを読み、LSHは目的ブロックの
+     * path上にある有効実ブロックをすべて返す。READ後の論理leafは、
+     * baselineではランダム、LSHでは最近傍medoidのクラスタprefixを固定し、
+     * READごとにrandom suffixを生成したleafへ再割り当てする。
      */
     public byte[] oblivious_access(int blockIndex, OPERATION op, byte[] newdata) {
         requestID++;
@@ -691,9 +736,9 @@ public class Client implements ClientInterface {
             }
             serverReadCount++;
             if (useLshLeafAssignment) {
-                // 各bucketから1スロット読み、目的ブロックと最類似候補1個だけを個別に返す。
+                // 目的ブロックのpath上にある有効実ブロックをすべて1 RPCで返す。
                 long phaseStart = System.nanoTime();
-                lshReadMeta = read_path_prefetch_real(position, blockIndex);
+                lshReadMeta = read_path_all_real(position);
                 prefetchReadNanos += System.nanoTime() - phaseStart;
             } else {
                 long phaseStart = System.nanoTime();
@@ -795,97 +840,53 @@ public class Client implements ClientInterface {
         read_block(pathID, blockIndex, meta_list);
     }
 
-    public BucketMetadata[] read_path_prefetch_real(int pathID, int targetBlockIndex) {
-        // 現行LSH miss処理。metadataからtargetと、同一path上でhashが最も近い
-        // 未取得実ブロックを最大1個選ぶ。サーバ応答はtarget/prefetchの2枠固定。
+    public BucketMetadata[] read_path_all_real(int pathID) {
+        // Path ORAMのREADと同様に、目的leafからrootまでのpath上にある
+        // 有効な実ブロックをすべて取得する。現在の設定では最大 HEIGHT * REAL_BLOCK_COUNT 件。
         BucketMetadata[] metaList = get_metadata(pathID);
-        int[] readOffsets = new int[Configs.HEIGHT];
-        int targetLevel = -1;
-        int targetOffset = -1;
+        int[][] blockIds = new int[Configs.HEIGHT][Configs.REAL_BLOCK_COUNT];
+        boolean[][] selected = new boolean[Configs.HEIGHT][Configs.REAL_BLOCK_COUNT];
+        int selectedCount = 0;
 
-        // まず目的ブロックの階層を確定する。同じbucketから2スロット読まないためにも使う。
+        // 応答の並びと一致するよう、leaf側のbucketからroot側へ、実ブロック枠順に記録する。
         for (int i = 0; i < Configs.HEIGHT; i++) {
             BucketMetadata meta = metaList[i];
             for (int slot = 0; slot < Configs.REAL_BLOCK_COUNT; slot++) {
+                int blockId = meta.get_block_index()[slot];
                 int offset = meta.get_offset()[slot];
-                if (meta.get_block_index()[slot] == targetBlockIndex
+                blockIds[i][slot] = blockId;
+                if (blockId >= 0 && blockId < position_map.length
                         && meta.getValid_bits()[offset] == (byte) 1) {
-                    targetLevel = i;
-                    targetOffset = offset;
-                    break;
+                    selected[i][slot] = true;
+                    selectedCount++;
                 }
-            }
-            if (targetLevel >= 0) break;
-        }
-
-        int prefetchLevel = -1;
-        int prefetchOffset = -1;
-        int prefetchBlockId = -1;
-        int bestDistance = Integer.MAX_VALUE;
-        String targetHash = targetBlockIndex >= 0 && targetBlockIndex < blockLshHashes.length
-                ? blockLshHashes[targetBlockIndex] : null;
-
-        // 目的ブロックとは別bucketにある候補から、hashのHamming距離が最小の1個だけを選ぶ。
-        if (targetHash != null) {
-            for (int i = 0; i < Configs.HEIGHT; i++) {
-                if (i == targetLevel) continue;
-                BucketMetadata meta = metaList[i];
-                for (int slot = 0; slot < Configs.REAL_BLOCK_COUNT; slot++) {
-                    int blockId = meta.get_block_index()[slot];
-                    int offset = meta.get_offset()[slot];
-                    if (blockId < 0 || blockId >= blockLshHashes.length
-                            || blockId == targetBlockIndex
-                            || meta.getValid_bits()[offset] != (byte) 1
-                            || blockLshHashes[blockId] == null
-                            || stash.find_by_blockIndex(blockId) != null) {
-                        continue;
-                    }
-                    int distance = hammingDistance(targetHash, blockLshHashes[blockId]);
-                    if (distance < bestDistance) {
-                        bestDistance = distance;
-                        prefetchLevel = i;
-                        prefetchOffset = offset;
-                        prefetchBlockId = blockId;
-                    }
-                }
-            }
-        }
-
-        for (int i = 0; i < Configs.HEIGHT; i++) {
-            BucketMetadata meta = metaList[i];
-            if (i == targetLevel) {
-                readOffsets[i] = targetOffset;
-            } else if (i == prefetchLevel) {
-                readOffsets[i] = prefetchOffset;
-            } else {
-                readOffsets[i] = math.get_random_dummy(meta.getValid_bits(), meta.get_offset());
             }
         }
 
         byte[] request = Ints.toByteArray(pathID);
-        for (int offset : readOffsets) {
-            request = Bytes.concat(request, Ints.toByteArray(offset));
-        }
-        request = Bytes.concat(request, Ints.toByteArray(targetLevel), Ints.toByteArray(prefetchLevel));
         byte[] header = MessageUtility.createMessageHeaderBytes(
                 MessageUtility.ORAM_READBLOCKS_PREFETCH, request.length);
         byte[] response = sendAndGetMessage(
                 ByteBuffer.wrap(Bytes.concat(header, request)),
                 MessageUtility.ORAM_READBLOCKS_PREFETCH);
 
-        int expectedLength = 2 * Configs.BLOCK_DATA_LEN;
+        int expectedLength = selectedCount * Configs.BLOCK_DATA_LEN;
         if (response == null || response.length != expectedLength) {
             throw new IllegalStateException("Invalid prefetch response length: "
                     + (response == null ? -1 : response.length));
         }
-        if (targetLevel >= 0) {
-            byte[] targetData = Arrays.copyOfRange(response, 0, Configs.BLOCK_DATA_LEN);
-            stash.add(new Block(targetBlockIndex, position_map[targetBlockIndex], targetData));
-        }
-        if (prefetchLevel >= 0) {
-            byte[] prefetchData = Arrays.copyOfRange(
-                    response, Configs.BLOCK_DATA_LEN, 2 * Configs.BLOCK_DATA_LEN);
-            stash.add(new Block(prefetchBlockId, position_map[prefetchBlockId], prefetchData));
+        int responseOffset = 0;
+        for (int i = 0; i < Configs.HEIGHT; i++) {
+            for (int slot = 0; slot < Configs.REAL_BLOCK_COUNT; slot++) {
+                if (!selected[i][slot]) {
+                    continue;
+                }
+                int blockId = blockIds[i][slot];
+                byte[] blockData = Arrays.copyOfRange(
+                        response, responseOffset, responseOffset + Configs.BLOCK_DATA_LEN);
+                stash.add(new Block(blockId, position_map[blockId], blockData));
+                responseOffset += Configs.BLOCK_DATA_LEN;
+            }
         }
         return metaList;
     }
@@ -1008,37 +1009,31 @@ public class Client implements ClientInterface {
     }
 
     private void delayed_single_evict_after_access(int accessedBlockIndex) {
-        // アクセスされたブロックは最近使われたものとして保持し、それ以外の寿命だけ減らす。
+        // アクセスされたブロックのcountは変更せず、それ以外だけ1減らす。
         for (Block block : stash.blocksSnapshot()) {
-            if (block.getBlockIndex() == accessedBlockIndex) {
-                block.setEvictCount(Configs.DEFAULT_DELAYED_EVICT_COUNT);
-            } else {
+            if (block.getBlockIndex() != accessedBlockIndex) {
                 block.decrementEvictCount();
             }
         }
 
-        // stashに余裕がある間は期限切れブロックも保持し、再アクセスによるhitを優先する。
-        // SOFT_LIMIT超過時のみ、期限切れ候補を単体evictする。
+        // stashサイズに関係なく、期限切れ候補を単体evictする。
         // 候補が不足した場合はcandidate == nullで終了し、無理にevictしない。
-        if (stash.size() > Configs.SOFT_STASH_LIMIT) {
-            Set<Integer> attempted = new HashSet<Integer>();
-            int singleEvictCount = 0;
-            while (singleEvictCount < Configs.MAX_SINGLE_EVICT_PER_ACCESS
-                    && stash.size() > Configs.SOFT_STASH_LIMIT) {
-                Block candidate = selectDelayedEvictCandidate(accessedBlockIndex, attempted);
-                if (candidate == null) {
-                    break;
-                }
-                attempted.add(candidate.getBlockIndex());
-                singleEvictAttempts++;
-                if (single_evict_block(candidate)) {
-                    singleEvictSuccesses++;
-                    singleEvictCount++;
-                } else {
-                    // bucketが満杯などで失敗した場合は、次回以降に再試行する。
-                    candidate.setEvictCount(0);
-                    singleEvictCount++;
-                }
+        Set<Integer> attempted = new HashSet<Integer>();
+        int singleEvictCount = 0;
+        while (singleEvictCount < Configs.MAX_SINGLE_EVICT_PER_ACCESS) {
+            Block candidate = selectDelayedEvictCandidate(accessedBlockIndex, attempted);
+            if (candidate == null) {
+                break;
+            }
+            attempted.add(candidate.getBlockIndex());
+            singleEvictAttempts++;
+            if (single_evict_block(candidate)) {
+                singleEvictSuccesses++;
+                singleEvictCount++;
+            } else {
+                // bucketが満杯などで失敗した場合は、次回以降に再試行する。
+                candidate.setEvictCount(0);
+                singleEvictCount++;
             }
         }
 
@@ -1072,7 +1067,8 @@ public class Client implements ClientInterface {
     }
 
     private boolean single_evict_block(Block target) {
-        // targetの論理leafからrootへ探索し、最初に格納可能なbucketへ1ブロックだけ戻す。
+        // Path ORAM側と同じく、targetの論理pathをglobal rootからleafへ探索し、
+        // 最初に格納可能なbucketへ1ブロックだけ戻す。
         // bucket全体はread-modify-writeし、既存の有効ブロックを保持する。
         if (target == null) {
             return false;
@@ -1082,16 +1078,23 @@ public class Client implements ClientInterface {
             return false;
         }
 
-        for (int pos_run = leaf; pos_run >= 0; pos_run = (pos_run - 1) >> 1) {
-            if (try_single_evict_to_bucket(target, pos_run)) {
+        int[] path = new int[Configs.HEIGHT];
+        int pathLength = 0;
+        for (int bucketId = leaf; bucketId >= 0; bucketId = (bucketId - 1) >> 1) {
+            path[pathLength++] = bucketId;
+            if (bucketId == 0) {
+                break;
+            }
+        }
+
+        for (int i = pathLength - 1; i >= 0; i--) {
+            int bucketId = path[i];
+            if (try_single_evict_to_bucket(target, bucketId)) {
                 System.out.println("[SINGLE-EVICT] blockIndex=" + target.getBlockIndex()
-                        + " bucket=" + pos_run
+                        + " bucket=" + bucketId
                         + " leaf=" + leaf
                         + " stashSize=" + stash.size());
                 return true;
-            }
-            if (pos_run == 0) {
-                break;
             }
         }
 

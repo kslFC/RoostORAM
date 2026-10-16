@@ -281,49 +281,37 @@ public class Server {
     }
 
     private byte[] handleReadBlocksPrefetch(ByteBuffer message) throws IOException {
-        if (message == null || message.remaining() < (4 + Configs.HEIGHT * 4 + 8)) {
-            return new byte[2 * Configs.BLOCK_DATA_LEN];
+        if (message == null || message.remaining() < 4) {
+            return new byte[0];
         }
 
         byte[] posBytes = new byte[4];
         message.get(posBytes);
         int position = Ints.fromByteArray(posBytes);
 
-        int[] readOffsets = new int[Configs.HEIGHT];
-        for (int i = 0; i < Configs.HEIGHT; i++) {
-            byte[] offsetBytes = new byte[4];
-            message.get(offsetBytes);
-            readOffsets[i] = Ints.fromByteArray(offsetBytes);
-        }
-
-        byte[] targetLevelBytes = new byte[4];
-        byte[] prefetchLevelBytes = new byte[4];
-        message.get(targetLevelBytes);
-        message.get(prefetchLevelBytes);
-        int targetLevel = Ints.fromByteArray(targetLevelBytes);
-        int prefetchLevel = Ints.fromByteArray(prefetchLevelBytes);
-
-        // targetと類似候補（最大1件）の2枠だけを固定長で返す。
-        // path上では各bucketの指定offsetを1つずつ消費するが、全bucket内容は送信しない。
-        byte[] response = new byte[2 * Configs.BLOCK_DATA_LEN];
+        // path上の全bucketから、有効な実ブロックをleaf側からroot側、実ブロック枠順で返す。
+        // 1回のpath READとして、各bucketのread counterは取得件数によらず1だけ増やす。
+        java.io.ByteArrayOutputStream response = new java.io.ByteArrayOutputStream(
+                Configs.HEIGHT * Configs.REAL_BLOCK_COUNT * Configs.BLOCK_DATA_LEN);
         for (int posRun = position, i = 0; posRun >= 0; posRun = (posRun - 1) >> 1, i++) {
             Bucket bucket = storage.get_bucket(posRun);
-            int offset = readOffsets[i];
-            if (offset >= 0 && offset < Configs.Z) {
-                byte[] blockData = bucket.getBlock(offset);
-                if (i == targetLevel) {
-                    System.arraycopy(blockData, 0, response, 0, Configs.BLOCK_DATA_LEN);
-                } else if (i == prefetchLevel) {
-                    System.arraycopy(blockData, 0, response,
-                            Configs.BLOCK_DATA_LEN, Configs.BLOCK_DATA_LEN);
+            BucketMetadata meta = bucket.getBucket_meta();
+            int[] blockIndexes = meta.get_block_index();
+            int[] offsets = meta.get_offset();
+            byte[] validBits = meta.getValid_bits();
+            for (int slot = 0; slot < Configs.REAL_BLOCK_COUNT; slot++) {
+                int offset = offsets[slot];
+                if (blockIndexes[slot] >= 0 && offset >= 0 && offset < Configs.Z
+                        && validBits[offset] == (byte) 1) {
+                    response.write(bucket.getBlock(offset));
+                    bucket.reset_valid_bits(offset);
                 }
-                bucket.reset_valid_bits(offset);
-                bucket.add_read_counter();
-                storage.set_bucket(posRun, bucket);
             }
+            bucket.add_read_counter();
+            storage.set_bucket(posRun, bucket);
             if (posRun == 0) break;
         }
-        return response;
+        return response.toByteArray();
     }
 
     private byte[] handleReadBucket(ByteBuffer message) throws IOException {
