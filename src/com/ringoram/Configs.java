@@ -36,11 +36,12 @@ public class Configs {
 	// 何回アクセスしたら定期evictを行うか。4なら4アクセスごとにevictする。
 	public static int SHUFFLE_RATE = 4;
 
-	// LSHモードの遅延evict設定。count初期値4、期限切れで単体evict、hard超過でpath fallback。
+	// LSHモードの遅延evict設定。count初期値4、miss時に期限切れ単体evictを一括要求、hard超過でfallback。
 	// baselineはこれらを使わず、従来のSHUFFLE_RATEごとのpath evictを行う。
 	public static int DEFAULT_DELAYED_EVICT_COUNT = 4;
 	public static int HARD_STASH_LIMIT = 36;
-	public static int MAX_SINGLE_EVICT_PER_ACCESS = 10;
+	// 1回のバッチ要求へまとめる単体evictの最大ブロック数。
+	public static int MAX_BATCH_EVICT_BLOCKS_PER_ACCESS = 10;
 	
 	//request operation: read or write
 	public enum OPERATION{ORAM_ACCESS_READ,ORAM_ACCESS_WRITE};

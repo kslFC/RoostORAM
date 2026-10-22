@@ -142,6 +142,11 @@ public class Server {
                     responseHeader = MessageUtility.createMessageHeaderBytes(
                             MessageUtility.ORAM_WRITEBUCKET, serializedResponse.length);
 
+                } else if (type == MessageUtility.ORAM_BATCH_SINGLE_EVICT) {
+                    serializedResponse = handleBatchSingleEvict(message);
+                    responseHeader = MessageUtility.createMessageHeaderBytes(
+                            MessageUtility.ORAM_BATCH_SINGLE_EVICT, serializedResponse.length);
+
                 } else {
                     // 未対応 type の安全策（null送信防止）
                     System.out.println("server received unknown message type: " + type);
@@ -344,6 +349,98 @@ public class Server {
         storage.set_bucket(bucket.getId(), bucket);
 
         return new byte[] { 1 };
+    }
+
+    private byte[] handleBatchSingleEvict(ByteBuffer message) throws IOException {
+        // payload: candidate count + candidateごとのblock ID, leaf ID, block data。
+        // 各候補は自身の論理pathをglobal rootからleafへ探索するが、通信は1 RPCにまとめる。
+        if (message == null || message.remaining() < 4) {
+            return Bytes.concat(Ints.toByteArray(0), Ints.toByteArray(0), Ints.toByteArray(0));
+        }
+
+        int candidateCount = message.getInt();
+        int candidateBytes = 8 + Configs.BLOCK_DATA_LEN;
+        if (candidateCount < 0
+                || candidateCount > Configs.MAX_BATCH_EVICT_BLOCKS_PER_ACCESS
+                || message.remaining() != candidateCount * candidateBytes) {
+            return Bytes.concat(Ints.toByteArray(0), Ints.toByteArray(0), Ints.toByteArray(0));
+        }
+
+        int successMask = 0;
+        int bucketReads = 0;
+        int bucketWrites = 0;
+        for (int candidateIndex = 0; candidateIndex < candidateCount; candidateIndex++) {
+            int blockId = message.getInt();
+            int leafId = message.getInt();
+            byte[] blockData = new byte[Configs.BLOCK_DATA_LEN];
+            message.get(blockData);
+            if (blockId < 0 || blockId >= Configs.BLOCK_COUNT
+                    || leafId < Configs.LEAF_START || leafId >= Configs.BUCKET_COUNT) {
+                continue;
+            }
+
+            int[] result = trySingleEvict(blockId, leafId, blockData);
+            bucketReads += result[1];
+            bucketWrites += result[2];
+            if (result[0] == 1) {
+                successMask |= (1 << candidateIndex);
+            }
+        }
+        return Bytes.concat(
+                Ints.toByteArray(successMask),
+                Ints.toByteArray(bucketReads),
+                Ints.toByteArray(bucketWrites));
+    }
+
+    private int[] trySingleEvict(int blockId, int leafId, byte[] blockData) throws IOException {
+        int[] pathLeafToRoot = new int[Configs.HEIGHT];
+        int pathLength = 0;
+        for (int bucketId = leafId; bucketId >= 0; bucketId = (bucketId - 1) >> 1) {
+            pathLeafToRoot[pathLength++] = bucketId;
+            if (bucketId == 0) break;
+        }
+
+        int bucketReads = 0;
+        for (int i = pathLength - 1; i >= 0; i--) {
+            int bucketId = pathLeafToRoot[i];
+            Bucket bucket = storage.get_bucket(bucketId);
+            bucketReads++;
+            BucketMetadata meta = bucket.getBucket_meta();
+            int[] blockIndexes = meta.get_block_index();
+            int[] offsets = meta.get_offset();
+            byte[] validBits = meta.getValid_bits();
+
+            // 同じ有効ブロックがある場合はdataを更新する。
+            for (int slot = 0; slot < Configs.REAL_BLOCK_COUNT; slot++) {
+                int offset = offsets[slot];
+                if (blockIndexes[slot] == blockId && validBits[offset] == (byte) 1) {
+                    writeBlockToBucketData(bucket.getBucket_data(), offset, blockData);
+                    storage.set_bucket(bucketId, bucket);
+                    return new int[] { 1, bucketReads, 1 };
+                }
+            }
+
+            // 空き枠または無効化済み枠へ配置する。
+            for (int slot = 0; slot < Configs.REAL_BLOCK_COUNT; slot++) {
+                int offset = offsets[slot];
+                if (blockIndexes[slot] < 0 || validBits[offset] == (byte) 0) {
+                    writeBlockToBucketData(bucket.getBucket_data(), offset, blockData);
+                    meta.set_blockIndex_bit(slot, blockId);
+                    validBits[offset] = (byte) 1;
+                    meta.setValid_bits(validBits);
+                    storage.set_bucket(bucketId, bucket);
+                    return new int[] { 1, bucketReads, 1 };
+                }
+            }
+        }
+        return new int[] { 0, bucketReads, 0 };
+    }
+
+    private void writeBlockToBucketData(byte[] bucketData, int offset, byte[] blockData) {
+        int start = offset * Configs.BLOCK_DATA_LEN;
+        Arrays.fill(bucketData, start, start + Configs.BLOCK_DATA_LEN, (byte) 0);
+        System.arraycopy(blockData, 0, bucketData, start,
+                Math.min(blockData.length, Configs.BLOCK_DATA_LEN));
     }
 
     public void initServer() {

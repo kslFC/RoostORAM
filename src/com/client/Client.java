@@ -14,10 +14,10 @@ import java.nio.ByteOrder;
 import java.nio.channels.AsynchronousChannelGroup;
 import java.nio.channels.AsynchronousSocketChannel;
 import java.security.SecureRandom;
+import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HashSet;
+import java.util.List;
 import java.util.Random;
-import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -34,7 +34,7 @@ import com.example.LSH;
  *
  * 実験では、通常のRing ORAM baselineと、READ後のleaf再割り当てにLSHを使う
  * LSH Ring ORAMを切り替える。LSHモードではhash-onlyクラスタリング、目的ブロックの
- * path上にある全実ブロックの取得、単体遅延evictを行い、baselineはランダムleafと定期path evictを使う。
+ * path上にある全実ブロックの取得、単体evict要求のバッチ化を行い、baselineはランダムleafと定期path evictを使う。
  * cache無効時もstashはORAM内部状態として維持するが、READ前のhit判定には使用しない。
  */
 public class Client implements ClientInterface {
@@ -148,12 +148,15 @@ public class Client implements ClientInterface {
     private long baselineEarlyReshuffleNanos;
     private int baselinePathEvictCount;
     private int baselineEarlyReshuffleBucketCount;
-    private int singleEvictAttempts;
-    private int singleEvictSuccesses;
+    private int batchEvictAttempts;
+    private int batchEvictSuccesses;
+    private int batchEvictedBlocks;
+    private int batchEvictBucketReads;
+    private int batchEvictBucketWrites;
     private int bucketRefreshAttempts;
     private int bucketRefreshSuccesses;
     private int fallbackEvictCount;
-    private final int[] requestCounts = new int[7];
+    private final int[] requestCounts = new int[8];
 
     @SuppressWarnings("rawtypes")
     public Client() {
@@ -261,8 +264,11 @@ public class Client implements ClientInterface {
     public long getBaselineEarlyReshuffleNanos() { return baselineEarlyReshuffleNanos; }
     public int getBaselinePathEvictCount() { return baselinePathEvictCount; }
     public int getBaselineEarlyReshuffleBucketCount() { return baselineEarlyReshuffleBucketCount; }
-    public int getSingleEvictAttempts() { return singleEvictAttempts; }
-    public int getSingleEvictSuccesses() { return singleEvictSuccesses; }
+    public int getBatchEvictAttempts() { return batchEvictAttempts; }
+    public int getBatchEvictSuccesses() { return batchEvictSuccesses; }
+    public int getBatchEvictedBlocks() { return batchEvictedBlocks; }
+    public int getBatchEvictBucketReads() { return batchEvictBucketReads; }
+    public int getBatchEvictBucketWrites() { return batchEvictBucketWrites; }
     public int getBucketRefreshAttempts() { return bucketRefreshAttempts; }
     public int getBucketRefreshSuccesses() { return bucketRefreshSuccesses; }
     public int getFallbackEvictCount() { return fallbackEvictCount; }
@@ -287,8 +293,11 @@ public class Client implements ClientInterface {
         baselineEarlyReshuffleNanos = 0L;
         baselinePathEvictCount = 0;
         baselineEarlyReshuffleBucketCount = 0;
-        singleEvictAttempts = 0;
-        singleEvictSuccesses = 0;
+        batchEvictAttempts = 0;
+        batchEvictSuccesses = 0;
+        batchEvictedBlocks = 0;
+        batchEvictBucketReads = 0;
+        batchEvictBucketWrites = 0;
         bucketRefreshAttempts = 0;
         bucketRefreshSuccesses = 0;
         fallbackEvictCount = 0;
@@ -794,18 +803,19 @@ public class Client implements ClientInterface {
         }
 
         if (useLshLeafAssignment) {
-            // LSHモードでは評価対象のREAD後だけ、遅延カウントに基づく単体evictを行う。
+            // LSHモードでは評価対象のREAD後だけ、期限切れ単体evictを1要求へまとめる。
             // 初期WRITE中に動かすと、後半ブロックだけがstashに残って実験条件が偏る。
             if (op == OPERATION.ORAM_ACCESS_READ) {
-                // stash hitではbucketを消費しないためrefresh確認も不要。
-                // missではprefetch前に取得済みのmetadataへ今回READの+1を加味して判定する。
+                // missで消費したpathのdummy枯渇を確認する。hit時はserverへ触れていないため不要。
                 if (!lastAccessStashHit && lshReadMeta != null) {
                     long refreshStart = System.nanoTime();
                     refresh_exhausted_buckets(position, lshReadMeta, true);
                     refreshCheckNanos += System.nanoTime() - refreshStart;
                 }
                 long phaseStart = System.nanoTime();
-                delayed_single_evict_after_access(blockIndex);
+                // miss時だけ最大10件の単体evictを1 RPCへまとめる。
+                // hit時は期限切れ候補をstashに保持し、次回missへ繰り越す。
+                delayed_batch_evict_after_access(blockIndex, !lastAccessStashHit);
                 delayedEvictNanos += System.nanoTime() - phaseStart;
             } else {
                 // 初期WRITEは従来どおり、処理後のmetadataを取得してdummy枯渇を確認する。
@@ -1008,7 +1018,7 @@ public class Client implements ClientInterface {
         }
     }
 
-    private void delayed_single_evict_after_access(int accessedBlockIndex) {
+    private void delayed_batch_evict_after_access(int accessedBlockIndex, boolean cacheMiss) {
         // アクセスされたブロックのcountは変更せず、それ以外だけ1減らす。
         for (Block block : stash.blocksSnapshot()) {
             if (block.getBlockIndex() != accessedBlockIndex) {
@@ -1016,25 +1026,10 @@ public class Client implements ClientInterface {
             }
         }
 
-        // stashサイズに関係なく、期限切れ候補を単体evictする。
-        // 候補が不足した場合はcandidate == nullで終了し、無理にevictしない。
-        Set<Integer> attempted = new HashSet<Integer>();
-        int singleEvictCount = 0;
-        while (singleEvictCount < Configs.MAX_SINGLE_EVICT_PER_ACCESS) {
-            Block candidate = selectDelayedEvictCandidate(accessedBlockIndex, attempted);
-            if (candidate == null) {
-                break;
-            }
-            attempted.add(candidate.getBlockIndex());
-            singleEvictAttempts++;
-            if (single_evict_block(candidate)) {
-                singleEvictSuccesses++;
-                singleEvictCount++;
-            } else {
-                // bucketが満杯などで失敗した場合は、次回以降に再試行する。
-                candidate.setEvictCount(0);
-                singleEvictCount++;
-            }
+        // miss時だけ、候補ごとの単体evictを1 RPCへまとめる。
+        // hit時は通信せず、期限切れ候補を次回missまでstashに保持する。
+        if (cacheMiss) {
+            batch_single_evict(accessedBlockIndex);
         }
 
         if (stash.size() > Configs.HARD_STASH_LIMIT) {
@@ -1049,101 +1044,70 @@ public class Client implements ClientInterface {
         }
     }
 
-    private Block selectDelayedEvictCandidate(int accessedBlockIndex, Set<Integer> attempted) {
-        Block best = null;
+    private void batch_single_evict(int accessedBlockIndex) {
+        List<Block> candidates = new ArrayList<Block>();
         for (Block block : stash.blocksSnapshot()) {
-            int blockIndex = block.getBlockIndex();
-            if (blockIndex == accessedBlockIndex || attempted.contains(blockIndex)) {
-                continue;
-            }
-            if (block.getEvictCount() > 0) {
-                continue;
-            }
-            if (best == null || block.getEvictCount() < best.getEvictCount()) {
-                best = block;
+            if (block.getBlockIndex() != accessedBlockIndex
+                    && block.getEvictCount() <= 0
+                    && block.getLeaf_id() >= Configs.LEAF_START
+                    && block.getLeaf_id() < Configs.BUCKET_COUNT) {
+                candidates.add(block);
             }
         }
-        return best;
-    }
-
-    private boolean single_evict_block(Block target) {
-        // Path ORAM側と同じく、targetの論理pathをglobal rootからleafへ探索し、
-        // 最初に格納可能なbucketへ1ブロックだけ戻す。
-        // bucket全体はread-modify-writeし、既存の有効ブロックを保持する。
-        if (target == null) {
-            return false;
+        // より長く期限切れになっているブロックを優先し、同値ならblock IDで決定的にする。
+        candidates.sort((left, right) -> {
+            int countCompare = Integer.compare(left.getEvictCount(), right.getEvictCount());
+            return countCompare != 0
+                    ? countCompare
+                    : Integer.compare(left.getBlockIndex(), right.getBlockIndex());
+        });
+        if (candidates.size() > Configs.MAX_BATCH_EVICT_BLOCKS_PER_ACCESS) {
+            candidates = new ArrayList<Block>(candidates.subList(
+                    0, Configs.MAX_BATCH_EVICT_BLOCKS_PER_ACCESS));
         }
-        int leaf = target.getLeaf_id();
-        if (leaf < Configs.LEAF_START || leaf >= Configs.BUCKET_COUNT) {
-            return false;
+        if (candidates.isEmpty()) {
+            return;
         }
 
-        int[] path = new int[Configs.HEIGHT];
-        int pathLength = 0;
-        for (int bucketId = leaf; bucketId >= 0; bucketId = (bucketId - 1) >> 1) {
-            path[pathLength++] = bucketId;
-            if (bucketId == 0) {
-                break;
-            }
+        byte[] request = Ints.toByteArray(candidates.size());
+        for (Block candidate : candidates) {
+            request = Bytes.concat(
+                    request,
+                    Ints.toByteArray(candidate.getBlockIndex()),
+                    Ints.toByteArray(candidate.getLeaf_id()),
+                    candidate.getData());
+        }
+        byte[] header = MessageUtility.createMessageHeaderBytes(
+                MessageUtility.ORAM_BATCH_SINGLE_EVICT, request.length);
+        batchEvictAttempts++;
+        byte[] response = sendAndGetMessage(
+                ByteBuffer.wrap(Bytes.concat(header, request)),
+                MessageUtility.ORAM_BATCH_SINGLE_EVICT);
+        if (response == null || response.length != 12) {
+            System.out.println("[BATCH-EVICT-FAIL] candidates=" + candidates.size()
+                    + " stashSize=" + stash.size());
+            return;
         }
 
-        for (int i = pathLength - 1; i >= 0; i--) {
-            int bucketId = path[i];
-            if (try_single_evict_to_bucket(target, bucketId)) {
-                System.out.println("[SINGLE-EVICT] blockIndex=" + target.getBlockIndex()
-                        + " bucket=" + bucketId
-                        + " leaf=" + leaf
-                        + " stashSize=" + stash.size());
-                return true;
+        int successMask = Ints.fromByteArray(Arrays.copyOfRange(response, 0, 4));
+        int bucketReads = Ints.fromByteArray(Arrays.copyOfRange(response, 4, 8));
+        int bucketWrites = Ints.fromByteArray(Arrays.copyOfRange(response, 8, 12));
+        int removed = 0;
+        for (int i = 0; i < candidates.size(); i++) {
+            if ((successMask & (1 << i)) != 0
+                    && stash.remove_by_blockIndex(candidates.get(i).getBlockIndex())) {
+                removed++;
             }
         }
-
-        System.out.println("[SINGLE-EVICT-FAIL] blockIndex=" + target.getBlockIndex()
-                + " leaf=" + leaf
+        batchEvictSuccesses++;
+        batchEvictedBlocks += removed;
+        batchEvictBucketReads += bucketReads;
+        batchEvictBucketWrites += bucketWrites;
+        System.out.println("[BATCH-SINGLE-EVICT] candidates=" + candidates.size()
+                + " blocks=" + removed
+                + " bucketReads=" + bucketReads
+                + " bucketWrites=" + bucketWrites
                 + " stashSize=" + stash.size());
-        return false;
-    }
-
-    private boolean try_single_evict_to_bucket(Block target, int bucket_id) {
-        Bucket bucket = read_bucket_object(bucket_id);
-        if (bucket == null) {
-            return false;
-        }
-
-        BucketMetadata meta = bucket.getBucket_meta();
-        int[] block_index = meta.get_block_index();
-        int[] offset = meta.get_offset();
-        byte[] valid_bits = meta.getValid_bits();
-        byte[] bucket_data = bucket.getBucket_data();
-
-        // 既に同じブロックが有効な状態で同じpath上にある場合は、dataだけ更新してstashから外す。
-        for (int i = 0; i < Configs.REAL_BLOCK_COUNT; i++) {
-            int offset_i = offset[i];
-            if (block_index[i] == target.getBlockIndex() && valid_bits[offset_i] == (byte) 1) {
-                write_block_to_bucket_data(bucket_data, offset_i, target.getData());
-                if (write_bucket_object(bucket)) {
-                    return stash.remove_by_blockIndex(target.getBlockIndex());
-                }
-                return false;
-            }
-        }
-
-        // 空き枠、または既に無効化された枠を再利用して1ブロックだけ追加する。
-        for (int i = 0; i < Configs.REAL_BLOCK_COUNT; i++) {
-            int offset_i = offset[i];
-            if (block_index[i] < 0 || valid_bits[offset_i] == (byte) 0) {
-                write_block_to_bucket_data(bucket_data, offset_i, target.getData());
-                meta.set_blockIndex_bit(i, target.getBlockIndex());
-                valid_bits[offset_i] = (byte) 1;
-                meta.setValid_bits(valid_bits);
-                if (write_bucket_object(bucket)) {
-                    return stash.remove_by_blockIndex(target.getBlockIndex());
-                }
-                return false;
-            }
-        }
-
-        return false;
     }
 
     private Bucket read_bucket_object(int bucket_id) {
@@ -1607,16 +1571,19 @@ public class Client implements ClientInterface {
         int prefetchReadRequests = client.getRequestCount(MessageUtility.ORAM_READBLOCKS_PREFETCH);
         int readBucketRequests = client.getRequestCount(MessageUtility.ORAM_READBUCKET);
         int writeBucketRequests = client.getRequestCount(MessageUtility.ORAM_WRITEBUCKET);
+        int batchSingleEvictRequests = client.getRequestCount(MessageUtility.ORAM_BATCH_SINGLE_EVICT);
         int bucketFileReads = 0;
         int bucketFileWrites = 0;
-        if (!useLsh) {
-            // 各RPCに対応するServerStorage呼び出し数。通信失敗がない実験での推定値。
-            bucketFileReads = getMetaRequests * Configs.HEIGHT
-                    + readBlockRequests * Configs.HEIGHT
-                    + readBucketRequests;
-            bucketFileWrites = readBlockRequests * Configs.HEIGHT
-                    + writeBucketRequests;
-        }
+        // 各RPCに対応するServerStorage呼び出し数。通信失敗がない実験での推定値。
+        bucketFileReads = getMetaRequests * Configs.HEIGHT
+                + readBlockRequests * Configs.HEIGHT
+                + prefetchReadRequests * Configs.HEIGHT
+                + readBucketRequests
+                + client.getBatchEvictBucketReads();
+        bucketFileWrites = readBlockRequests * Configs.HEIGHT
+                + prefetchReadRequests * Configs.HEIGHT
+                + writeBucketRequests
+                + client.getBatchEvictBucketWrites();
 
         double[] groupHitRates = new double[accessGroups.length];
         for (int groupId = 0; groupId < accessGroups.length; groupId++) {
@@ -1629,7 +1596,8 @@ public class Client implements ClientInterface {
                 readBlockRequests,
                 prefetchReadRequests,
                 readBucketRequests,
-                writeBucketRequests
+                writeBucketRequests,
+                batchSingleEvictRequests
         };
         lastExperimentMetrics = new ExperimentMetrics(
                 experimentMode, useLsh, useCache, accessSeed, oramSeed, transitionCount,
@@ -1672,8 +1640,11 @@ public class Client implements ClientInterface {
             resultOut.println("[DIAGNOSTIC-MAINTENANCE] baselinePathEvicts="
                     + client.getBaselinePathEvictCount()
                     + " baselineReshuffleBuckets=" + client.getBaselineEarlyReshuffleBucketCount()
-                    + " singleEvictAttempts=" + client.getSingleEvictAttempts()
-                    + " singleEvictSuccesses=" + client.getSingleEvictSuccesses()
+                    + " batchEvictAttempts=" + client.getBatchEvictAttempts()
+                    + " batchEvictSuccesses=" + client.getBatchEvictSuccesses()
+                    + " batchEvictedBlocks=" + client.getBatchEvictedBlocks()
+                    + " batchEvictBucketReads=" + client.getBatchEvictBucketReads()
+                    + " batchEvictBucketWrites=" + client.getBatchEvictBucketWrites()
                     + " refreshAttempts=" + client.getBucketRefreshAttempts()
                     + " refreshSuccesses=" + client.getBucketRefreshSuccesses()
                     + " fallbackEvicts=" + client.getFallbackEvictCount());
@@ -1682,6 +1653,7 @@ public class Client implements ClientInterface {
                     + " prefetchRead=" + prefetchReadRequests
                     + " readBucket=" + readBucketRequests
                     + " writeBucket=" + writeBucketRequests
+                    + " batchSingleEvict=" + batchSingleEvictRequests
                     + " estimatedFileReads=" + bucketFileReads
                     + " estimatedFileWrites=" + bucketFileWrites);
         }
