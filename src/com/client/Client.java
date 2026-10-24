@@ -1071,10 +1071,12 @@ public class Client implements ClientInterface {
 
         byte[] request = Ints.toByteArray(candidates.size());
         for (Block candidate : candidates) {
+            int clusterRoot = clusterRootForLeaf(candidate.getLeaf_id());
             request = Bytes.concat(
                     request,
                     Ints.toByteArray(candidate.getBlockIndex()),
                     Ints.toByteArray(candidate.getLeaf_id()),
+                    Ints.toByteArray(clusterRoot),
                     candidate.getData());
         }
         byte[] header = MessageUtility.createMessageHeaderBytes(
@@ -1108,6 +1110,15 @@ public class Client implements ClientInterface {
                 + " bucketReads=" + bucketReads
                 + " bucketWrites=" + bucketWrites
                 + " stashSize=" + stash.size());
+    }
+
+    private int clusterRootForLeaf(int leafId) {
+        int clusterDepth = Math.max(0, Math.min(lshClusterPrefixBits, Configs.HEIGHT - 1));
+        int bucketId = leafId;
+        for (int depth = Configs.HEIGHT - 1; depth > clusterDepth; depth--) {
+            bucketId = (bucketId - 1) >> 1;
+        }
+        return bucketId;
     }
 
     private Bucket read_bucket_object(int bucket_id) {

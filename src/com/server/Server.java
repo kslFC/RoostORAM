@@ -359,7 +359,7 @@ public class Server {
         }
 
         int candidateCount = message.getInt();
-        int candidateBytes = 8 + Configs.BLOCK_DATA_LEN;
+        int candidateBytes = 12 + Configs.BLOCK_DATA_LEN;
         if (candidateCount < 0
                 || candidateCount > Configs.MAX_BATCH_EVICT_BLOCKS_PER_ACCESS
                 || message.remaining() != candidateCount * candidateBytes) {
@@ -372,6 +372,7 @@ public class Server {
         for (int candidateIndex = 0; candidateIndex < candidateCount; candidateIndex++) {
             int blockId = message.getInt();
             int leafId = message.getInt();
+            int clusterRootId = message.getInt();
             byte[] blockData = new byte[Configs.BLOCK_DATA_LEN];
             message.get(blockData);
             if (blockId < 0 || blockId >= Configs.BLOCK_COUNT
@@ -379,7 +380,7 @@ public class Server {
                 continue;
             }
 
-            int[] result = trySingleEvict(blockId, leafId, blockData);
+            int[] result = trySingleEvict(blockId, leafId, clusterRootId, blockData);
             bucketReads += result[1];
             bucketWrites += result[2];
             if (result[0] == 1) {
@@ -392,7 +393,8 @@ public class Server {
                 Ints.toByteArray(bucketWrites));
     }
 
-    private int[] trySingleEvict(int blockId, int leafId, byte[] blockData) throws IOException {
+    private int[] trySingleEvict(
+            int blockId, int leafId, int clusterRootId, byte[] blockData) throws IOException {
         int[] pathLeafToRoot = new int[Configs.HEIGHT];
         int pathLength = 0;
         for (int bucketId = leafId; bucketId >= 0; bucketId = (bucketId - 1) >> 1) {
@@ -400,9 +402,30 @@ public class Server {
             if (bucketId == 0) break;
         }
 
+        int clusterRootIndex = -1;
+        for (int i = 0; i < pathLength; i++) {
+            if (pathLeafToRoot[i] == clusterRootId) {
+                clusterRootIndex = i;
+                break;
+            }
+        }
+        if (clusterRootIndex < 0) {
+            return new int[] { 0, 0, 0 };
+        }
+
         int bucketReads = 0;
-        for (int i = pathLength - 1; i >= 0; i--) {
-            int bucketId = pathLeafToRoot[i];
+        // cluster root -> descendants -> leaf -> ancestors -> global root
+        int[] searchOrder = new int[pathLength];
+        int orderLength = 0;
+        for (int i = clusterRootIndex; i >= 0; i--) {
+            searchOrder[orderLength++] = pathLeafToRoot[i];
+        }
+        for (int i = clusterRootIndex + 1; i < pathLength; i++) {
+            searchOrder[orderLength++] = pathLeafToRoot[i];
+        }
+
+        for (int i = 0; i < orderLength; i++) {
+            int bucketId = searchOrder[i];
             Bucket bucket = storage.get_bucket(bucketId);
             bucketReads++;
             BucketMetadata meta = bucket.getBucket_meta();
