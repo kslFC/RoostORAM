@@ -35,6 +35,7 @@ import com.example.LSH;
  * 実験では、通常のRing ORAM baselineと、READ後のleaf再割り当てにLSHを使う
  * LSH Ring ORAMを切り替える。LSHモードではhash-onlyクラスタリング、目的ブロックの
  * path上にある全実ブロックの取得、単体evict要求のバッチ化を行い、baselineはランダムleafと定期path evictを使う。
+ * baseline-no-cacheは擬似Path ORAMとして、cacheを使わず毎回path上の全実ブロックを取得する。
  * cache無効時もstashはORAM内部状態として維持するが、READ前のhit判定には使用しない。
  */
 public class Client implements ClientInterface {
@@ -705,8 +706,8 @@ public class Client implements ClientInterface {
      * ORAMアクセスの中心処理。
      *
      * READではcache有効時だけstashを先に確認し、hitならサーバへ行かずに返す。
-     * miss時はbaselineが目的ブロックと各bucketのdummyを読み、LSHは目的ブロックの
-     * path上にある有効実ブロックをすべて返す。READ後の論理leafは、
+     * miss時はbaseline-cacheが目的ブロックと各bucketのdummyを読み、LSHと
+     * baseline-no-cacheは目的ブロックのpath上にある有効実ブロックをすべて返す。READ後の論理leafは、
      * baselineではランダム、LSHでは最近傍medoidのクラスタprefixを固定し、
      * READごとにrandom suffixを生成したleafへ再割り当てする。
      */
@@ -751,7 +752,14 @@ public class Client implements ClientInterface {
                 prefetchReadNanos += System.nanoTime() - phaseStart;
             } else {
                 long phaseStart = System.nanoTime();
-                read_path(position, blockIndex);
+                if (useCache) {
+                    // baseline-cacheは通常のRing ORAM READを維持する。
+                    read_path(position, blockIndex);
+                } else {
+                    // baseline-no-cacheは擬似Path ORAMとして、毎回path上の全実ブロックを取得する。
+                    // stashに対象が存在してもcache hitにはせず、サーバREADを省略しない。
+                    read_path_all_real(position);
+                }
                 baselineReadPathNanos += System.nanoTime() - phaseStart;
             }
             block = stash.find_by_blockIndex(blockIndex);
