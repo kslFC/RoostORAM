@@ -1,0 +1,18 @@
+.DS_Store
+.vscode/
+*.class
+
+# Java build output. The runtime scripts and bundled Guava JAR remain tracked.
+/bin/com/
+
+# Experiment logs are generated locally; keep only the empty directory marker.
+/results/*.txt
+
+# Large embedding models are not required to run the included experiment data.
+/models/
+/src/lib/
+/target/
+
+# Ignore arbitrary generated JARs while retaining the runtime dependency.
+*.jar
+!/bin/lib/guava-33.0.0-jre.jar

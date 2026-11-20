@@ -1,0 +1,77 @@
+package com.ringoram;
+
+
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+
+
+
+
+
+
+/** Persists each server-side ORAM bucket as a separate serialized file. */
+public class ServerStorage {
+
+	public ServerStorage(){
+
+	}
+
+
+	public void set_bucket(int id,Bucket bkt) throws IOException{
+		String dst = Configs.STORAGE_PATH + id;
+		File f = new File(dst);
+		File storageDirectory = f.getParentFile();
+		if (storageDirectory != null
+				&& !storageDirectory.isDirectory()
+				&& !storageDirectory.mkdirs()
+				&& !storageDirectory.isDirectory()) {
+			throw new IOException("Failed to create server storage directory: "
+					+ storageDirectory.getAbsolutePath());
+		}
+		if(!f.exists())
+			f.createNewFile();
+
+        FileOutputStream out;
+        try {
+            out = new FileOutputStream(f);
+            ObjectOutputStream objOut=new ObjectOutputStream(out);
+            objOut.writeObject(bkt);
+            objOut.flush();
+            objOut.close();
+
+        } catch (IOException e) {
+            System.out.println("write bucket "+id+" failed");
+            e.printStackTrace();
+        }
+	}
+
+
+	public Bucket get_bucket(int id) throws IOException{
+		String dst = Configs.STORAGE_PATH + id;
+		Bucket bucket = new Bucket();
+
+		File f = new File(dst);
+		if(!f.exists()){
+			System.out.println("error:when reading bucket "+id+", find no file in storage!");
+		}
+        FileInputStream in;
+        try {
+            in = new FileInputStream(f);
+            ObjectInputStream objIn=new ObjectInputStream(in);
+            bucket = (Bucket) objIn.readObject();
+            objIn.close();
+
+        } catch (IOException e) {
+            System.out.println("read bucket "+id+" failed");
+            e.printStackTrace();
+        } catch (ClassNotFoundException e) {
+            e.printStackTrace();
+        }
+		return bucket;
+	}
+}
